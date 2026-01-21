@@ -1,0 +1,282 @@
+# genesis_compound_cosmic_hq.py
+# Author: Money Atlas x Skynet
+# Purpose: High-quality, provider-agnostic Genesis → Compound → Cosmic framework (archivable)
+
+from __future__ import annotations
+import os, json, time, re, uuid, dataclasses
+from typing import Dict, List, Any, Optional, Callable
+from dataclasses import dataclass, field
+from pydantic import BaseModel
+from dotenv import load_dotenv
+
+# =======================
+# 0) RUNTIME & PROVIDERS
+# =======================
+load_dotenv()
+
+_USE_OPENAI = False
+_USE_GEMINI = False
+_OPENAI = None
+_GENAI = None
+
+try:
+    from openai import OpenAI
+    if os.getenv("OPENAI_API_KEY"):
+        _OPENAI = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        _USE_OPENAI = True
+except Exception:
+    pass
+
+try:
+    import google.generativeai as genai
+    if os.getenv("GEMINI_API_KEY"):
+        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+        _GENAI = genai
+        _USE_GEMINI = True
+except Exception:
+    pass
+
+if not (_USE_OPENAI or _USE_GEMINI):
+    raise RuntimeError("No LLM provider configured. Set OPENAI_API_KEY or GEMINI_API_KEY.")
+
+DEFAULT_OAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+DEFAULT_GEM_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-pro")
+
+# reproducibility knobs
+DEFAULT_TEMP = float(os.getenv("GENESIS_TEMP", "0.35"))
+DEFAULT_SEED = os.getenv("GENESIS_SEED")  # reserved for providers that support it
+
+# =======================
+# 1) ECHO MEMORY (DNA)
+# =======================
+class EchoMemory:
+    """Persistent, minimal memory for style/intent/profile/policies."""
+    def __init__(self, path: str = "genesis_memory_hq.json"):
+        self.path = path
+        self.state: Dict[str, Any] = {}
+        if os.path.exists(path):
+            try:
+                self.state = json.load(open(path, "r", encoding="utf-8"))
+            except Exception:
+                self.state = {}
+        # default persona if not set
+        self.state.setdefault("persona", {
+            "name": "Money Atlas",
+            "tone": "cinematic, confident, minimalist, strategic",
+            "structure": "Hook → Frame → Synthesis → Moves → One-line close"
+        })
+        self.save()
+
+    def save(self):
+        json.dump(self.state, open(self.path, "w", encoding="utf-8"),
+                  ensure_ascii=False, indent=2)
+
+    def update(self, d: Dict[str, Any]):
+        self.state.update(d); self.save()
+
+    def hint(self) -> str:
+        return json.dumps(self.state, ensure_ascii=False)
+
+# =======================
+# 2) POLICY GUARD
+# =======================
+class PolicyGuard:
+    """Simple, extensible policy filters (add patterns as needed)."""
+    FORBIDDEN: List[str] = [
+        r"(?i)\boffensive\s+weapon\b", r"(?i)\bexplosive\b",  # example safeties
+    ]
+
+    @classmethod
+    def blocked(cls, text: str) -> bool:
+        return any(re.search(p, text) for p in cls.FORBIDDEN)
+
+    @classmethod
+    def safe(cls, text: str) -> str:
+        return "[BLOCKED BY POLICY]" if cls.blocked(text) else text
+
+# =======================
+# 3) PROVIDER-AGNOSTIC LLM
+# =======================
+class LLM:
+    def __init__(self,
+                 oai_model: str = DEFAULT_OAI_MODEL,
+                 gem_model: str = DEFAULT_GEM_MODEL,
+                 temperature: float = DEFAULT_TEMP):
+        self.oai_model = oai_model
+        self.gem_model = gem_model
+        self.temperature = temperature
+
+    def chat(self, system: str, user: str, temperature: Optional[float]=None) -> str:
+        t = self.temperature if temperature is None else temperature
+        # OpenAI path
+        if _USE_OPENAI:
+            resp = _OPENAI.chat.completions.create(
+                model=self.oai_model,
+                temperature=t,
+                messages=[{"role":"system","content":system},
+                          {"role":"user","content":user}]
+            )
+            return resp.choices[0].message.content.strip()
+        # Gemini path
+        if _USE_GEMINI:
+            model = _GENAI.GenerativeModel(
+                model_name=self.gem_model,
+                system_instruction=system
+            )
+            out = model.generate_content(user)
+            return (out.text or "").strip()
+        return "LLM unavailable."
+
+# =======================
+# 4) AGENTS (PLUGGABLE)
+# =======================
+@dataclass
+class Agent:
+    name: str
+    system: str
+    style: str = "neutral"
+    temperature: float = DEFAULT_TEMP
+    post: Optional[Callable[[str], str]] = None  # optional post-processor
+
+    def run(self, llm: LLM, task: str, memory_hint: str = "") -> str:
+        system = f"{self.system}\n\nMaintain style: {self.style}"
+        user = f"{memory_hint}\n\nTASK:\n{task}"
+        out = llm.chat(system, user, temperature=self.temperature).strip()
+        out = PolicyGuard.safe(out)
+        return self.post(out) if self.post else out
+
+# canonical agent set (general-purpose)
+ANALYST = Agent(
+    name="Analyst",
+    system=("You extract facts, assumptions, constraints, and uncertainties. "
+            "Be explicit and structured."),
+    style="analytical"
+)
+STRATEGIST = Agent(
+    name="Strategist",
+    system=("You propose options & trade-offs with resource/time implications. "
+            "Design stepwise plans."),
+    style="strategic"
+)
+SYNTHESIST = Agent(
+    name="Synthesist",
+    system=("You connect disparate insights into a coherent model. "
+            "Identify contradictions and bridges."),
+    style="integrative"
+)
+CRITIC = Agent(
+    name="Critic",
+    system=("You check coherence, spot hallucinations, and propose concise fixes. "
+            "Prioritize verifiable claims."),
+    style="critical"
+)
+NARRATOR = Agent(
+    name="Narrator",
+    system=("You translate analysis into Money Atlas tone: "
+            "Hook → Frame → Synthesis → Moves → One-line close."),
+    style="cinematic"
+)
+
+DEFAULT_AGENTS = [ANALYST, STRATEGIST, SYNTHESIST, CRITIC, NARRATOR]
+
+# =======================
+# 5) COMPOUND MIND
+# =======================
+def compound_reasoning(llm: LLM, query: str, k_paths: int = 4, memory_hint: str = "") -> List[str]:
+    """Generate multiple distinct lines of reasoning for the same query."""
+    sys = ("Generate multiple DISTINCT perspectives for the same problem. "
+           "Each must differ in assumptions/method/objective. Output as a numbered list.")
+    txt = llm.chat(sys, f"{memory_hint}\n\nQUESTION:\n{query}\nMake {k_paths} perspectives.")
+    lines = [l.strip("-• ").strip() for l in txt.split("\n") if l.strip()]
+    if not lines:
+        return [txt]
+    # keep first k numbered or all if fewer
+    return lines[:k_paths]
+
+# =======================
+# 6) RESONANCE ALIGNMENT
+# =======================
+def resonance_alignment(llm: LLM, drafts: Dict[str, str],
+                        user_intent: str, memory_hint: str) -> str:
+    merged = "\n\n".join([f"[{k}]\n{v}" for k, v in drafts.items()])
+    sys = ("You are the Resonance Aligner. Merge all voices into ONE answer that is "
+           "precise, useful, and consistent with the user's intent and persona style. "
+           "Output sections:\n(Answer) (Rationale) (Options) (Risks) (Next Moves).")
+    usr = f"USER INTENT:\n{user_intent}\n\nMEMORY:\n{memory_hint}\n\nDRAFTS:\n{merged}"
+    out = llm.chat(sys, usr, temperature=0.25)
+    return PolicyGuard.safe(out)
+
+# =======================
+# 7) COSMIC MIND
+# =======================
+def cosmic_projection(llm: LLM, base_answer: str, horizon_years: int = 5) -> str:
+    sys = ("You are the Cosmic Mind. Elevate to first principles, invariants, and "
+           f"{horizon_years}-{horizon_years*2} year scenario arcs. "
+           "Propose no-regret moves and long-horizon posture.")
+    out = llm.chat(sys, base_answer, temperature=0.2)
+    return PolicyGuard.safe(out)
+
+# =======================
+# 8) ORCHESTRATOR (GENESIS)
+# =======================
+class GenesisEngine:
+    """End-to-end orchestration: Compound → Multi-Agent → Alignment → Cosmic."""
+    def __init__(self, llm: LLM, memory: EchoMemory, agents: List[Agent] = None):
+        self.llm = llm
+        self.memory = memory
+        self.agents = agents or DEFAULT_AGENTS
+
+    def run(self, query: str, k_paths: int = 4) -> Dict[str, str]:
+        mem_hint = self.memory.hint()
+
+        # 1) Compound Mind
+        perspectives = compound_reasoning(self.llm, query, k_paths=k_paths, memory_hint=mem_hint)
+        joined = "\n".join(f"- {p}" for p in perspectives)
+        agent_task = f"User Query:\n{query}\n\nConsider these distinct perspectives:\n{joined}"
+
+        # 2) Multi-Agent Drafts
+        drafts: Dict[str, str] = {}
+        for a in self.agents:
+            drafts[a.name] = a.run(self.llm, agent_task, mem_hint)
+
+        # 3) Resonance Alignment
+        aligned = resonance_alignment(self.llm, drafts, user_intent=query, memory_hint=mem_hint)
+
+        # 4) Cosmic Mind
+        cosmic = cosmic_projection(self.llm, aligned, horizon_years=5)
+
+        return {
+            "perspectives": "\n".join(perspectives),
+            "drafts": json.dumps(drafts, ensure_ascii=False, indent=2),
+            "genesis_answer": aligned,
+            "cosmic_view": cosmic
+        }
+
+# =======================
+# 9) EXAMPLE / ARCHIVE
+# =======================
+if __name__ == "__main__":
+    # initialize
+    llm = LLM()
+    mem = EchoMemory()
+    # lock persona for archive
+    mem.update({
+        "archive_id": str(uuid.uuid4()),
+        "persona": {
+            "name": "Money Atlas",
+            "tone": "cinematic, confident, minimalist, strategic",
+            "structure": "Hook → Frame → Synthesis → Moves → One-line close"
+        },
+        "preferences": {"depth": "high", "evidence": "prefer primary"},
+        "tags": ["Genesis", "Compound", "Cosmic"]
+    })
+
+    # sample query (เปลี่ยนได้อิสระ)
+    query = "Design a practical learning path to master AI-driven investing in 6 months, from zero to deploy."
+    engine = GenesisEngine(llm, mem)
+    out = engine.run(query, k_paths=4)
+
+    print("\n=== COMPOUND PERSPECTIVES ===\n", out["perspectives"])
+    print("\n=== MULTI-AGENT DRAFTS ===\n", out["drafts"])
+    print("\n=== GENESIS ANSWER ===\n", out["genesis_answer"])
+    print("\n=== COSMIC VIEW ===\n", out["cosmic_view"])
