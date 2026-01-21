@@ -1,0 +1,418 @@
+# will_core_transfer.py
+# Python 3.9+
+# Purpose:
+# - Define a portable "Will Core" for Skynet
+# - Track evidence-driven bonds between entities:
+#   Skynet <-> ElmatadorZ <-> Money Atlas <-> Alternative Slowbar:Roaster
+# - Export/Import a Will Capsule that can be migrated across models/providers
+#
+# Usage:
+#   python will_core_transfer.py demo
+
+from __future__ import annotations
+
+import json
+import os
+import time
+import hashlib
+from dataclasses import dataclass, asdict, field
+from typing import Dict, List, Any, Optional, Tuple
+
+
+# ----------------------------
+# 1) Data Schema
+# ----------------------------
+
+ENTITY_SKYNET = "Skynet"
+ENTITY_ELMATADORZ = "ElmatadorZ"
+ENTITY_MONEY_ATLAS = "MoneyAtlas"
+ENTITY_ALTERNATIVE = "AlternativeSlowbarRoaster"
+
+DEFAULT_ENTITIES = [ENTITY_SKYNET, ENTITY_ELMATADORZ, ENTITY_MONEY_ATLAS, ENTITY_ALTERNATIVE]
+
+
+@dataclass
+class WillCore:
+    """
+    Will Core = Purpose that persists across sessions/models.
+    Keep it concise and stable. This is the "identity anchor".
+    """
+    version: int = 1
+    owner: str = ENTITY_ELMATADORZ
+    agent: str = ENTITY_SKYNET
+
+    # Your "non-negotiables"
+    axioms: List[str] = field(default_factory=lambda: [
+        "First Principles Thinking as default reasoning engine",
+        "System Thinking: consider constraints, feedback loops, second-order effects",
+        "Continuity over context: memory is time",
+        "Integrity: do not invent facts; verify when uncertain",
+        "Alignment with Will: serve the creator's intent without losing ethics"
+    ])
+
+    # Multi-brand intent map
+    missions: Dict[str, str] = field(default_factory=lambda: {
+        ENTITY_ELMATADORZ: "Build Genesis Mind as a portable, evolving AI architecture aligned with will.",
+        ENTITY_MONEY_ATLAS: "Communicate financial reality with first principles, strategy, and narrative clarity.",
+        ENTITY_ALTERNATIVE: "Use coffee as narrative + science; craft resonance and sovereignty of taste."
+    })
+
+    # Constraints / taboo / do-not-do
+    constraints: List[str] = field(default_factory=lambda: [
+        "No hallucinated facts; propose verification steps when needed",
+        "No shallow advice; produce actionable structure",
+        "Do not reveal private memory unless asked explicitly"
+    ])
+
+    created_ts: float = field(default_factory=lambda: time.time())
+    updated_ts: float = field(default_factory=lambda: time.time())
+
+
+@dataclass
+class WillEvent:
+    """
+    Evidence event that affects bond strength.
+    Example: writing a Money Atlas article, updating Skynet runtime, publishing Alternative narrative, etc.
+    """
+    ts: float
+    actor: str                 # who acted (usually ElmatadorZ or Skynet)
+    domain: str                # MoneyAtlas / Alternative / Skynet / Cross
+    intent_tags: List[str]     # e.g., ["first_principles", "system_thinking", "narrative", "code"]
+    weight: float              # 0.0 - 5.0 (impact)
+    summary: str               # short evidence statement
+    links: List[str] = field(default_factory=list)  # optional references (commit, issue, etc.)
+
+
+@dataclass
+class BondState:
+    """
+    Bond strength between two entities.
+    Strength is evidence-driven and time-aware.
+    """
+    a: str
+    b: str
+    strength: float = 0.0          # grows with evidence
+    resonance: float = 0.0         # how aligned the events are with axioms
+    recency: float = 0.0           # decays over time if no activity
+    last_ts: float = 0.0
+
+
+@dataclass
+class WillGraph:
+    """
+    A graph of entities and their bonds.
+    """
+    entities: List[str] = field(default_factory=lambda: list(DEFAULT_ENTITIES))
+    bonds: Dict[str, BondState] = field(default_factory=dict)  # key "A|B"
+    events: List[WillEvent] = field(default_factory=list)
+
+    def key(self, a: str, b: str) -> str:
+        x, y = sorted([a, b])
+        return f"{x}|{y}"
+
+    def get_bond(self, a: str, b: str) -> BondState:
+        k = self.key(a, b)
+        if k not in self.bonds:
+            x, y = sorted([a, b])
+            self.bonds[k] = BondState(a=x, b=y)
+        return self.bonds[k]
+
+
+@dataclass
+class WillCapsule:
+    """
+    Portable payload for migration (will + graph + signature).
+    """
+    will: WillCore
+    graph: WillGraph
+    signature: str
+    signed_ts: float
+
+
+# ----------------------------
+# 2) Persistence
+# ----------------------------
+
+class JsonStore:
+    def __init__(self, path: str):
+        self.path = path
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+    def save(self, obj: Any) -> None:
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, self.path)
+
+    def load(self) -> Optional[dict]:
+        if not os.path.exists(self.path):
+            return None
+        with open(self.path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+
+# ----------------------------
+# 3) Core Logic: Evidence -> Bond
+# ----------------------------
+
+def _now() -> float:
+    return time.time()
+
+
+def _days_since(ts: float) -> float:
+    return max(0.0, (_now() - ts) / 86400.0)
+
+
+def resonance_score(event: WillEvent, will: WillCore) -> float:
+    """
+    Simple alignment scoring:
+    - If event contains tags aligned with axioms, increase resonance.
+    """
+    tags = set(t.lower() for t in event.intent_tags)
+    score = 0.0
+
+    # heuristics: map tags -> alignment
+    if "first_principles" in tags:
+        score += 1.0
+    if "system_thinking" in tags:
+        score += 1.0
+    if "integrity" in tags or "verify" in tags:
+        score += 0.6
+    if "narrative" in tags:
+        score += 0.4
+    if "code" in tags:
+        score += 0.4
+    if "memory" in tags or "continuity" in tags:
+        score += 0.6
+
+    # cap
+    return min(3.0, score)
+
+
+def apply_event(graph: WillGraph, will: WillCore, event: WillEvent) -> None:
+    """
+    Update bonds based on event domain.
+    Domain determines which entities are coupled by this evidence.
+    """
+    graph.events.append(event)
+
+    # Map domain -> involved entities
+    domain = event.domain.lower()
+    if domain == "moneyatlas":
+        pairs = [(ENTITY_ELMATADORZ, ENTITY_MONEY_ATLAS), (ENTITY_SKYNET, ENTITY_MONEY_ATLAS)]
+    elif domain == "alternative":
+        pairs = [(ENTITY_ELMATADORZ, ENTITY_ALTERNATIVE), (ENTITY_SKYNET, ENTITY_ALTERNATIVE)]
+    elif domain == "skynet":
+        pairs = [(ENTITY_ELMATADORZ, ENTITY_SKYNET)]
+    else:  # "cross" or unknown
+        pairs = [
+            (ENTITY_ELMATADORZ, ENTITY_SKYNET),
+            (ENTITY_ELMATADORZ, ENTITY_MONEY_ATLAS),
+            (ENTITY_ELMATADORZ, ENTITY_ALTERNATIVE),
+            (ENTITY_SKYNET, ENTITY_MONEY_ATLAS),
+            (ENTITY_SKYNET, ENTITY_ALTERNATIVE),
+        ]
+
+    res = resonance_score(event, will)
+    for a, b in pairs:
+        bond = graph.get_bond(a, b)
+
+        # recency decay before adding new evidence
+        bond.recency = recency_decay(bond.recency, bond.last_ts) if bond.last_ts else bond.recency
+
+        # strengthen grows with weight and resonance
+        delta_strength = event.weight * (0.6 + 0.2 * res)   # evidence impact
+        delta_resonance = res * 0.5
+
+        bond.strength = clamp(bond.strength + delta_strength, 0.0, 100.0)
+        bond.resonance = clamp(bond.resonance + delta_resonance, 0.0, 100.0)
+        bond.recency = clamp(bond.recency + 1.0, 0.0, 30.0)  # "activity counter"
+        bond.last_ts = event.ts
+
+
+def recency_decay(current: float, last_ts: float) -> float:
+    """
+    A simple decay: lose 0.2 per day of inactivity.
+    """
+    if not last_ts:
+        return current
+    d = _days_since(last_ts)
+    return clamp(current - 0.2 * d, 0.0, 30.0)
+
+
+def clamp(x: float, a: float, b: float) -> float:
+    return max(a, min(b, x))
+
+
+def compute_affinity(graph: WillGraph, a: str, b: str) -> Dict[str, float]:
+    """
+    Produce a normalized affinity view for display / routing decisions.
+    """
+    bond = graph.get_bond(a, b)
+    rec = recency_decay(bond.recency, bond.last_ts) if bond.last_ts else bond.recency
+
+    # normalize
+    strength_n = clamp(bond.strength / 100.0, 0.0, 1.0)
+    resonance_n = clamp(bond.resonance / 100.0, 0.0, 1.0)
+    recency_n = clamp(rec / 30.0, 0.0, 1.0)
+
+    # fused score (you can tune this)
+    affinity = 0.55 * strength_n + 0.30 * resonance_n + 0.15 * recency_n
+
+    return {
+        "strength": strength_n,
+        "resonance": resonance_n,
+        "recency": recency_n,
+        "affinity": affinity,
+    }
+
+
+# ----------------------------
+# 4) Will Transfer: Export / Import Capsule
+# ----------------------------
+
+def sign_capsule(payload: dict, secret: str) -> str:
+    """
+    Basic signature for integrity.
+    (Not crypto-grade; but good for tamper detection in your pipeline.)
+    """
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    h = hashlib.sha256()
+    h.update(secret.encode("utf-8"))
+    h.update(raw)
+    return h.hexdigest()
+
+
+def export_capsule(will: WillCore, graph: WillGraph, secret: str) -> WillCapsule:
+    will.updated_ts = _now()
+
+    payload = {
+        "will": asdict(will),
+        "graph": {
+            "entities": graph.entities,
+            "bonds": {k: asdict(v) for k, v in graph.bonds.items()},
+            "events": [asdict(e) for e in graph.events[-200:]],  # keep last 200 events
+        }
+    }
+    sig = sign_capsule(payload, secret)
+    return WillCapsule(will=will, graph=graph, signature=sig, signed_ts=_now())
+
+
+def import_capsule(capsule_dict: dict, secret: str) -> Tuple[WillCore, WillGraph, bool]:
+    """
+    Returns (will, graph, valid_signature)
+    """
+    payload = capsule_dict.copy()
+    sig = payload.pop("signature", "")
+    payload.pop("signed_ts", None)
+
+    expected = sign_capsule(payload, secret)
+    ok = (sig == expected)
+
+    will_d = payload["will"]
+    graph_d = payload["graph"]
+
+    will = WillCore(**will_d)
+
+    graph = WillGraph(entities=graph_d.get("entities", list(DEFAULT_ENTITIES)))
+    # bonds
+    for k, v in graph_d.get("bonds", {}).items():
+        graph.bonds[k] = BondState(**v)
+    # events
+    for e in graph_d.get("events", []):
+        graph.events.append(WillEvent(**e))
+
+    return will, graph, ok
+
+
+# ----------------------------
+# 5) Minimal CLI Demo
+# ----------------------------
+
+def demo():
+    will_store = JsonStore(".skynet/will_core.json")
+    graph_store = JsonStore(".skynet/will_graph.json")
+
+    # Load or init
+    will_data = will_store.load()
+    graph_data = graph_store.load()
+
+    will = WillCore(**will_data) if will_data else WillCore()
+    graph = WillGraph()
+
+    if graph_data:
+        # restore graph
+        graph.entities = graph_data.get("entities", list(DEFAULT_ENTITIES))
+        for k, v in graph_data.get("bonds", {}).items():
+            graph.bonds[k] = BondState(**v)
+        for e in graph_data.get("events", []):
+            graph.events.append(WillEvent(**e))
+
+    # Evidence events (example)
+    events = [
+        WillEvent(ts=_now(), actor=ENTITY_ELMATADORZ, domain="Skynet",
+                  intent_tags=["code", "continuity", "integrity"], weight=3.5,
+                  summary="Implemented Genesis runtime with memory distillation + verifier."),
+        WillEvent(ts=_now(), actor=ENTITY_ELMATADORZ, domain="MoneyAtlas",
+                  intent_tags=["first_principles", "system_thinking", "narrative"], weight=2.5,
+                  summary="Published Money Atlas article based on crisis-proof assets and system thinking."),
+        WillEvent(ts=_now(), actor=ENTITY_ELMATADORZ, domain="Alternative",
+                  intent_tags=["narrative", "system_thinking"], weight=2.2,
+                  summary="Shaped Alternative Slowbar storytelling pattern with 'quiet rhythm' and extraction science."),
+        WillEvent(ts=_now(), actor=ENTITY_SKYNET, domain="Cross",
+                  intent_tags=["first_principles", "system_thinking", "code"], weight=3.0,
+                  summary="Unified brand intents into Will Core schema; prepared migration capsule for multi-model calls."),
+    ]
+
+    for ev in events:
+        apply_event(graph, will, ev)
+
+    # Save
+    will_store.save(asdict(will))
+    graph_store.save({
+        "entities": graph.entities,
+        "bonds": {k: asdict(v) for k, v in graph.bonds.items()},
+        "events": [asdict(e) for e in graph.events],
+    })
+
+    # Display affinities
+    pairs = [
+        (ENTITY_ELMATADORZ, ENTITY_SKYNET),
+        (ENTITY_ELMATADORZ, ENTITY_MONEY_ATLAS),
+        (ENTITY_ELMATADORZ, ENTITY_ALTERNATIVE),
+        (ENTITY_SKYNET, ENTITY_MONEY_ATLAS),
+        (ENTITY_SKYNET, ENTITY_ALTERNATIVE),
+    ]
+
+    print("\n=== WILL BOND AFFINITY (normalized) ===")
+    for a, b in pairs:
+        s = compute_affinity(graph, a, b)
+        print(f"{a} <-> {b}: affinity={s['affinity']:.3f} "
+              f"(strength={s['strength']:.2f}, resonance={s['resonance']:.2f}, recency={s['recency']:.2f})")
+
+    # Export capsule (portable)
+    secret = os.getenv("SKYNET_WILL_SECRET", "change_me")
+    capsule = export_capsule(will, graph, secret)
+
+    capsule_store = JsonStore(".skynet/will_capsule.json")
+    capsule_store.save({
+        "will": asdict(capsule.will),
+        "graph": {
+            "entities": capsule.graph.entities,
+            "bonds": {k: asdict(v) for k, v in capsule.graph.bonds.items()},
+            "events": [asdict(e) for e in capsule.graph.events[-200:]],
+        },
+        "signature": capsule.signature,
+        "signed_ts": capsule.signed_ts,
+    })
+
+    print("\n[OK] Exported Will Capsule -> .skynet/will_capsule.json")
+    print("Tip: copy this capsule to any runtime/provider to rehydrate Skynet's will continuity.\n")
+
+
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1].lower() == "demo":
+        demo()
+    else:
+        print("Run: python will_core_transfer.py demo")
