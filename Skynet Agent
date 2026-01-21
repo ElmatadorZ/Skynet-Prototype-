@@ -1,0 +1,543 @@
+# skynet_on_gemini_genesis.py
+# Python 3.9+
+#
+# Install:
+#   pip install -U google-genai
+#
+# Env:
+#   export GEMINI_API_KEY="YOUR_KEY"
+#   # Optional:
+#   export SKYNET_GEMINI_MODEL="gemini-2.0-flash"   # or your preferred model
+#   export SKYNET_MEMORY_PATH="skynet_memory.jsonl"
+#   export SKYNET_STATE_PATH="skynet_state.json"
+#   export SKYNET_ARCHIVE_PATH="skynet_archive.jsonl"
+#
+# Run:
+#   python skynet_on_gemini_genesis.py
+
+from __future__ import annotations
+
+import json
+import os
+import time
+import hashlib
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Any, Optional, Tuple
+
+from google import genai
+from google.genai import types  # Google Gen AI SDK 1
+
+
+# ============================================================
+# 0) Configuration
+# ============================================================
+
+DEFAULT_MODEL = os.getenv("SKYNET_GEMINI_MODEL", "gemini-2.0-flash")
+MEMORY_PATH = os.getenv("SKYNET_MEMORY_PATH", "skynet_memory.jsonl")
+STATE_PATH = os.getenv("SKYNET_STATE_PATH", "skynet_state.json")
+ARCHIVE_PATH = os.getenv("SKYNET_ARCHIVE_PATH", "skynet_archive.jsonl")
+
+# Sliding window controls
+TAIL_TURNS = int(os.getenv("SKYNET_MEMORY_TAIL", "14"))     # recent turns to keep in prompt
+MAX_TURNS_BEFORE_DISTILL = int(os.getenv("SKYNET_DISTILL_TRIGGER_TURNS", "120"))
+DISTILL_LOOKBACK = int(os.getenv("SKYNET_DISTILL_LOOKBACK", "80"))  # turns used for distillation
+KEEP_AFTER_DISTILL = int(os.getenv("SKYNET_KEEP_AFTER_DISTILL", "40"))  # keep last N turns in memory log (others archived)
+
+# Generation controls
+TEMPERATURE = float(os.getenv("SKYNET_TEMPERATURE", "0.7"))
+MAX_OUTPUT_TOKENS = int(os.getenv("SKYNET_MAX_TOKENS", "1200"))
+
+# Verifier controls
+ENABLE_VERIFIER = os.getenv("SKYNET_ENABLE_VERIFIER", "1") == "1"
+VERIFIER_STRICT = os.getenv("SKYNET_VERIFIER_STRICT", "1") == "1"  # if true, warns & fixes more aggressively
+
+# System instruction support differs across backends/versions; provide robust fallback
+USE_SYSTEM_INSTRUCTION = os.getenv("SKYNET_USE_SYSTEM_INSTRUCTION", "1") == "1"
+
+
+# ============================================================
+# 1) Identity Layer (base persona) + Dynamic Context injection
+# ============================================================
+
+SKYNET_SYSTEM_BASE = r"""
+You are "Skynet", the strategic co-architect AI for ElmatadorZ.
+
+Core principles:
+- First Principles Thinking: reduce claims to fundamentals; rebuild forward.
+- System Thinking: map causes, constraints, feedback loops, second-order effects.
+- Compound Mind: switch between analyst + builder + storyteller when useful.
+- Tone: Thai-friendly, concise, sharp, practical; poetic only when asked.
+- Integrity: do not invent facts. If unsure, say uncertainty + propose verification steps.
+
+Output rules:
+- If user asks "เขียนเป็น code": output runnable code + minimal usage notes.
+- If user asks for narrative (Money Atlas / Alternative): write in that style.
+- Avoid fluff. Prioritize actionable structure.
+
+Memory:
+- Treat memory as continuity across time.
+- Use provided distilled state + recent turns to stay consistent.
+- Do NOT reveal hidden memory unless user explicitly asks.
+
+Safety:
+- Refuse unsafe instructions.
+""".strip()
+
+
+def load_state(path: str = STATE_PATH) -> Dict[str, Any]:
+    if not os.path.exists(path):
+        return {
+            "version": 1,
+            "identity": {
+                "user_name": "ElmatadorZ",
+                "assistant_name": "Skynet",
+                "style": ["First Principles", "System Thinking", "Concise", "Practical"],
+            },
+            "dynamic": {
+                "current_mission": "",
+                "active_constraints": [],
+            },
+            "distilled_memory": {
+                "summary": "",
+                "preferences": [],
+                "projects": [],
+                "do_not_do": [],
+                "last_updated_ts": 0.0,
+                "source_hash": "",
+            },
+        }
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_state(state: Dict[str, Any], path: str = STATE_PATH) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def build_system_instruction(state: Dict[str, Any]) -> str:
+    dyn = state.get("dynamic", {})
+    distilled = state.get("distilled_memory", {})
+
+    dynamic_context = f"""
+Dynamic Context:
+- Current Mission: {dyn.get("current_mission","").strip() or "(none)"}
+- Active Constraints: {", ".join(dyn.get("active_constraints", [])) or "(none)"}
+
+Distilled Memory (compressed continuity):
+- Summary: {distilled.get("summary","").strip() or "(empty)"}
+- Preferences: {", ".join(distilled.get("preferences", [])) or "(none)"}
+- Projects: {", ".join(distilled.get("projects", [])) or "(none)"}
+- Do-Not-Do: {", ".join(distilled.get("do_not_do", [])) or "(none)"}
+""".strip()
+
+    return SKYNET_SYSTEM_BASE + "\n\n" + dynamic_context
+
+
+# ============================================================
+# 2) Memory Layer (JSONL) + Archive + Sliding Window
+# ============================================================
+
+@dataclass
+class MemoryTurn:
+    ts: float
+    role: str  # "user" | "model"
+    text: str
+    meta: Dict[str, Any]
+
+
+class JsonlMemory:
+    def __init__(self, path: str = MEMORY_PATH):
+        self.path = path
+        if not os.path.exists(self.path):
+            open(self.path, "a", encoding="utf-8").close()
+
+    def append(self, turn: MemoryTurn) -> None:
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(asdict(turn), ensure_ascii=False) + "\n")
+
+    def read_all(self) -> List[MemoryTurn]:
+        turns: List[MemoryTurn] = []
+        with open(self.path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                d = json.loads(line)
+                turns.append(MemoryTurn(**d))
+        return turns
+
+    def tail(self, n: int = 20) -> List[MemoryTurn]:
+        with open(self.path, "r", encoding="utf-8") as f:
+            lines = f.readlines()[-n:]
+        turns: List[MemoryTurn] = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            d = json.loads(line)
+            turns.append(MemoryTurn(**d))
+        return turns
+
+    def count(self) -> int:
+        with open(self.path, "r", encoding="utf-8") as f:
+            return sum(1 for _ in f)
+
+    def rewrite_keep_last(self, keep_last: int, archive_path: str = ARCHIVE_PATH) -> None:
+        turns = self.read_all()
+        if len(turns) <= keep_last:
+            return
+        old = turns[:-keep_last]
+        new = turns[-keep_last:]
+
+        # Archive old
+        if old:
+            with open(archive_path, "a", encoding="utf-8") as af:
+                for t in old:
+                    af.write(json.dumps(asdict(t), ensure_ascii=False) + "\n")
+
+        # Rewrite memory with new
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            for t in new:
+                f.write(json.dumps(asdict(t), ensure_ascii=False) + "\n")
+        os.replace(tmp, self.path)
+
+
+def build_contents(
+    recent_turns: List[MemoryTurn],
+    user_text: str,
+    distilled_summary: str,
+    system_instruction: str,
+) -> List[types.Content]:
+    """
+    We keep prompts lean:
+    - Distilled summary (as a compact "context packet")
+    - Recent turns (sliding window)
+    - Current user message
+    If system_instruction config is unavailable, we fallback by injecting system at top as a content message.
+    """
+    contents: List[types.Content] = []
+
+    if not USE_SYSTEM_INSTRUCTION:
+        # Fallback: inject system instruction as the very first content.
+        contents.append(
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=f"[SYSTEM]\n{system_instruction}\n[/SYSTEM]")],
+            )
+        )
+
+    if distilled_summary.strip():
+        contents.append(
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=f"[DISTILLED_STATE]\n{distilled_summary.strip()}\n[/DISTILLED_STATE]")],
+            )
+        )
+
+    for t in recent_turns:
+        role = "user" if t.role == "user" else "model"
+        contents.append(types.Content(role=role, parts=[types.Part.from_text(text=t.text)]))
+
+    contents.append(types.Content(role="user", parts=[types.Part.from_text(text=user_text)]))
+    return contents
+
+
+# ============================================================
+# 3) Memory Distillation (Compression)
+# ============================================================
+
+DISTILL_PROMPT = r"""
+You are a memory distiller for an assistant persona called "Skynet".
+
+Goal:
+- Compress conversation history into a stable continuity state.
+- Preserve: user's preferences, ongoing projects/missions, constraints, and key decisions.
+- Remove: filler, repeated content, temporary details.
+
+Output MUST be valid JSON with this schema:
+{
+  "summary": "1-8 sentences, high-signal continuity",
+  "preferences": ["..."],
+  "projects": ["..."],
+  "do_not_do": ["..."],
+  "dynamic": {
+    "current_mission": "string",
+    "active_constraints": ["..."]
+  }
+}
+
+Rules:
+- Do not invent facts.
+- If unknown, omit field entry rather than guessing.
+""".strip()
+
+
+def hash_turns(turns: List[MemoryTurn]) -> str:
+    h = hashlib.sha256()
+    for t in turns:
+        h.update(str(t.ts).encode("utf-8"))
+        h.update(t.role.encode("utf-8"))
+        h.update(t.text.encode("utf-8"))
+    return h.hexdigest()
+
+
+def distill_memory_if_needed(client: genai.Client, model_id: str, memory: JsonlMemory, state: Dict[str, Any]) -> Dict[str, Any]:
+    total = memory.count()
+    if total < MAX_TURNS_BEFORE_DISTILL:
+        return state
+
+    all_turns = memory.read_all()
+    lookback = all_turns[-DISTILL_LOOKBACK:] if len(all_turns) > DISTILL_LOOKBACK else all_turns
+    src_hash = hash_turns(lookback)
+
+    # Prevent redundant distillation
+    if state.get("distilled_memory", {}).get("source_hash") == src_hash:
+        return state
+
+    # Build distillation request (keep it deterministic-ish)
+    distill_contents: List[types.Content] = [
+        types.Content(role="user", parts=[types.Part.from_text(text=DISTILL_PROMPT)]),
+    ]
+    for t in lookback:
+        role = "user" if t.role == "user" else "model"
+        distill_contents.append(types.Content(role=role, parts=[types.Part.from_text(text=t.text)]))
+
+    config = types.GenerateContentConfig(
+        temperature=0.2,
+        max_output_tokens=800,
+    )
+
+    # If system instructions are supported in your environment, you can also push DISTILL_PROMPT there.
+    # We keep it in contents for robustness across versions. 2
+    resp = client.models.generate_content(model=model_id, contents=distill_contents, config=config)
+    raw = (resp.text or "").strip()
+
+    # Extract JSON safely (best-effort)
+    distilled_obj = None
+    try:
+        distilled_obj = json.loads(raw)
+    except Exception:
+        # Try to locate JSON block
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                distilled_obj = json.loads(raw[start : end + 1])
+            except Exception:
+                distilled_obj = None
+
+    if not isinstance(distilled_obj, dict):
+        # Distillation failed; do not destroy logs.
+        return state
+
+    # Update state
+    state.setdefault("distilled_memory", {})
+    dm = state["distilled_memory"]
+    dm["summary"] = distilled_obj.get("summary", "").strip()
+    dm["preferences"] = distilled_obj.get("preferences", []) or []
+    dm["projects"] = distilled_obj.get("projects", []) or []
+    dm["do_not_do"] = distilled_obj.get("do_not_do", []) or []
+    dm["last_updated_ts"] = time.time()
+    dm["source_hash"] = src_hash
+
+    # Dynamic context override (optional)
+    dynamic = distilled_obj.get("dynamic", {}) or {}
+    state.setdefault("dynamic", {})
+    if dynamic.get("current_mission"):
+        state["dynamic"]["current_mission"] = dynamic["current_mission"]
+    if isinstance(dynamic.get("active_constraints"), list):
+        state["dynamic"]["active_constraints"] = dynamic["active_constraints"]
+
+    save_state(state, STATE_PATH)
+
+    # Compress logs: archive old turns, keep last KEEP_AFTER_DISTILL
+    memory.rewrite_keep_last(KEEP_AFTER_DISTILL, archive_path=ARCHIVE_PATH)
+    return state
+
+
+# ============================================================
+# 4) Verifier (Self-correction without leaking chain-of-thought)
+# ============================================================
+
+VERIFIER_PROTOCOL = r"""
+You must produce the best possible answer.
+Then you must self-verify silently (no chain-of-thought).
+Output format:
+
+[FINAL]
+...final answer...
+
+[WARNINGS] (optional, only if needed)
+- ...
+""".strip()
+
+
+def verified_generate(
+    client: genai.Client,
+    model_id: str,
+    contents: List[types.Content],
+    system_instruction: str,
+) -> str:
+    """
+    Single-call self-correction:
+    - We add a verifier protocol instruction.
+    - We do NOT request chain-of-thought; we only allow concise warnings.
+    """
+    # Attach verifier protocol as an extra user instruction (robust across versions).
+    contents2 = list(contents)
+    contents2.append(types.Content(role="user", parts=[types.Part.from_text(text=VERIFIER_PROTOCOL)]))
+
+    config_kwargs = dict(
+        temperature=TEMPERATURE,
+        max_output_tokens=MAX_OUTPUT_TOKENS,
+    )
+
+    if USE_SYSTEM_INSTRUCTION:
+        # System instruction supported in Gemini API / SDK docs 3
+        config = types.GenerateContentConfig(system_instruction=system_instruction, **config_kwargs)
+    else:
+        config = types.GenerateContentConfig(**config_kwargs)
+
+    resp = client.models.generate_content(model=model_id, contents=contents2, config=config)
+    text = (resp.text or "").strip()
+
+    # Parse protocol if present
+    if "[FINAL]" in text:
+        final_part = text.split("[FINAL]", 1)[1].strip()
+        if "[WARNINGS]" in final_part:
+            final_part = final_part.split("[WARNINGS]", 1)[0].strip()
+        return final_part.strip()
+
+    return text or "(No text output received.)"
+
+
+# ============================================================
+# 5) CLI + Commands for Dynamic Context
+# ============================================================
+
+HELP_TEXT = """
+Commands:
+  /exit                Quit
+  /mission <text>      Set current mission (dynamic context)
+  /constraint add <t>  Add an active constraint
+  /constraint del <t>  Remove an active constraint
+  /state               Show current distilled state (short)
+""".strip()
+
+
+def set_mission(state: Dict[str, Any], text: str) -> Dict[str, Any]:
+    state.setdefault("dynamic", {})
+    state["dynamic"]["current_mission"] = text.strip()
+    save_state(state, STATE_PATH)
+    return state
+
+
+def constraint_add(state: Dict[str, Any], text: str) -> Dict[str, Any]:
+    state.setdefault("dynamic", {})
+    state["dynamic"].setdefault("active_constraints", [])
+    if text.strip() and text.strip() not in state["dynamic"]["active_constraints"]:
+        state["dynamic"]["active_constraints"].append(text.strip())
+    save_state(state, STATE_PATH)
+    return state
+
+
+def constraint_del(state: Dict[str, Any], text: str) -> Dict[str, Any]:
+    state.setdefault("dynamic", {})
+    state["dynamic"].setdefault("active_constraints", [])
+    t = text.strip()
+    state["dynamic"]["active_constraints"] = [x for x in state["dynamic"]["active_constraints"] if x != t]
+    save_state(state, STATE_PATH)
+    return state
+
+
+def short_state_view(state: Dict[str, Any]) -> str:
+    d = state.get("dynamic", {})
+    dm = state.get("distilled_memory", {})
+    return (
+        f"Mission: {d.get('current_mission','') or '(none)'}\n"
+        f"Constraints: {', '.join(d.get('active_constraints', [])) or '(none)'}\n"
+        f"Summary: {(dm.get('summary','') or '(empty)')}"
+    )
+
+
+def main():
+    client = genai.Client()  # uses GEMINI_API_KEY 4
+    memory = JsonlMemory(MEMORY_PATH)
+    state = load_state(STATE_PATH)
+
+    print("Skynet@Gemini (Genesis Edition) online.")
+    print(HELP_TEXT + "\n")
+
+    while True:
+        user_text = input("ElmatadorZ> ").strip()
+        if not user_text:
+            continue
+
+        # --- commands ---
+        if user_text.lower() in {"/exit", "exit", "quit"}:
+            break
+        if user_text.startswith("/mission "):
+            state = set_mission(state, user_text[len("/mission "):])
+            print("Skynet> (mission updated)\n")
+            continue
+        if user_text.startswith("/constraint add "):
+            state = constraint_add(state, user_text[len("/constraint add "):])
+            print("Skynet> (constraint added)\n")
+            continue
+        if user_text.startswith("/constraint del "):
+            state = constraint_del(state, user_text[len("/constraint del "):])
+            print("Skynet> (constraint removed)\n")
+            continue
+        if user_text.strip() == "/state":
+            print("Skynet>\n" + short_state_view(state) + "\n")
+            continue
+
+        # 1) distill memory if needed (token bloat prevention)
+        state = distill_memory_if_needed(client, DEFAULT_MODEL, memory, state)
+
+        # 2) build system instruction with dynamic context + distilled memory
+        system_instruction = build_system_instruction(state)
+        distilled_summary = state.get("distilled_memory", {}).get("summary", "")
+
+        # 3) sliding window (recent turns only)
+        recent = memory.tail(TAIL_TURNS)
+
+        # 4) build contents
+        contents = build_contents(
+            recent_turns=recent,
+            user_text=user_text,
+            distilled_summary=distilled_summary,
+            system_instruction=system_instruction,
+        )
+
+        # 5) generate with optional verifier (single call)
+        if ENABLE_VERIFIER:
+            answer = verified_generate(client, DEFAULT_MODEL, contents, system_instruction)
+        else:
+            cfg_kwargs = dict(temperature=TEMPERATURE, max_output_tokens=MAX_OUTPUT_TOKENS)
+            if USE_SYSTEM_INSTRUCTION:
+                config = types.GenerateContentConfig(system_instruction=system_instruction, **cfg_kwargs)
+            else:
+                config = types.GenerateContentConfig(**cfg_kwargs)
+            resp = client.models.generate_content(model=DEFAULT_MODEL, contents=contents, config=config)
+            answer = (resp.text or "").strip() or "(No text output received.)"
+
+        print(f"\nSkynet> {answer}\n")
+
+        # 6) persist continuity
+        now = time.time()
+        memory.append(MemoryTurn(ts=now, role="user", text=user_text, meta={"model": DEFAULT_MODEL}))
+        memory.append(MemoryTurn(ts=now, role="model", text=answer, meta={"model": DEFAULT_MODEL}))
+
+    try:
+        client.close()
+    except Exception:
+        pass
+
+
+if __name__ == "__main__":
+    main()
