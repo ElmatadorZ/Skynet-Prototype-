@@ -1,0 +1,507 @@
+"""
+SKYNET_GENESIS_MASTERPIECE v1.0
+================================
+A “full-system” AGI-style prototype scaffold:
+- Genesis Mind = Compound Thinking + Memory(Time) + Will(Purpose)
+- First Principle Codex = Atomic axioms + tests + decomposition + verification
+- Cosmic Mind = multi-horizon scenario fields + second-order loops (relativity-inspired frames)
+- Skynet Core Will = identity + non-negotiables + style + risk gates
+- Skills System = lightweight folder-based Markdown skills (Anthropic-style), tool registry + runners
+- Audit = append-only event log + chain hash (tamper-evident)
+- Execution = multi-agent orchestrator + verifier + synthesizer + replayable runs
+
+Run:
+  python skynet_genesis_masterpiece.py
+
+Optional:
+- Put skills folders in:
+    ~/.skynet/skills/<skill_name>/skill.md
+  with optional python helpers in that folder.
+- This file stays dependency-free by default.
+
+Notes:
+- This is not “real AGI”—it’s a ruthless architecture you can harden and extend.
+- Replace DummyLLM with your real adapters.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import json
+import time
+import math
+import uuid
+import hashlib
+import random
+import importlib.util
+from dataclasses import dataclass, field, asdict
+from typing import Any, Dict, List, Optional, Tuple, Callable, Protocol, Iterable
+
+
+# ============================================================
+# 0) CORE UTILS
+# ============================================================
+
+def now_ts() -> float:
+    return time.time()
+
+def iso_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+
+def uid(prefix: str = "id") -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+def clamp(x: float, a: float, b: float) -> float:
+    return max(a, min(b, x))
+
+def softmax(xs: List[float], temp: float = 1.0) -> List[float]:
+    if not xs:
+        return []
+    temp = max(1e-9, temp)
+    m = max(xs)
+    exps = [math.exp((x - m) / temp) for x in xs]
+    s = sum(exps) or 1.0
+    return [e / s for e in exps]
+
+def stable_json(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+def pretty_json(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, indent=2, default=str)
+
+def sha256_hex(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def strip_md(text: str) -> str:
+    # minimal strip; keep content readable
+    text = re.sub(r"```.*?```", "", text, flags=re.S)
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(r"#+\s*", "", text)
+    text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
+    text = re.sub(r"\*(.*?)\*", r"\1", text)
+    return text.strip()
+
+def tokenize_simple(text: str) -> List[str]:
+    # language-agnostic-ish: split by whitespace and punctuation
+    t = re.sub(r"[^\w\u0E00-\u0E7F]+", " ", text.lower()).strip()
+    return [w for w in t.split() if w]
+
+
+# ============================================================
+# 1) AUDIT TRAIL (Append-only + Hash Chain)
+# ============================================================
+
+@dataclass
+class AuditEvent:
+    id: str
+    t: float
+    iso: str
+    kind: str
+    data: Dict[str, Any]
+    prev_hash: str
+    hash: str
+
+class AuditTrail:
+    """
+    Tamper-evident event chain:
+      hash_i = sha256( stable_json({event_without_hash}) + prev_hash )
+    """
+
+    def __init__(self):
+        self.events: List[AuditEvent] = []
+        self._tail_hash = "GENESIS"  # root seed
+
+    def log(self, kind: str, data: Dict[str, Any]) -> AuditEvent:
+        payload = {
+            "id": uid("log"),
+            "t": now_ts(),
+            "iso": iso_now(),
+            "kind": kind,
+            "data": data,
+            "prev_hash": self._tail_hash,
+        }
+        h = sha256_hex(stable_json(payload) + payload["prev_hash"])
+        evt = AuditEvent(**payload, hash=h)
+        self.events.append(evt)
+        self._tail_hash = h
+        return evt
+
+    def export(self) -> Dict[str, Any]:
+        return {"tail_hash": self._tail_hash, "events": [asdict(e) for e in self.events]}
+
+    def tail(self, n: int = 12) -> List[AuditEvent]:
+        return self.events[-n:]
+
+
+# ============================================================
+# 2) MEMORY (Time = Continuity)
+# ============================================================
+
+@dataclass
+class MemoryItem:
+    id: str
+    t: float
+    iso: str
+    kind: str
+    text: str
+    tags: List[str] = field(default_factory=list)
+    meta: Dict[str, Any] = field(default_factory=dict)
+    strength: float = 0.0  # reinforcement / importance
+
+class MemoryStore:
+    """
+    Minimal but useful memory:
+    - append items
+    - retrieve via keyword overlap + recency + strength
+    - can persist to json if you want
+    """
+
+    def __init__(self, audit: AuditTrail):
+        self.audit = audit
+        self.items: List[MemoryItem] = []
+
+    def add(self, kind: str, text: str, tags: Optional[List[str]] = None, meta: Optional[Dict[str, Any]] = None, strength: float = 0.0) -> MemoryItem:
+        it = MemoryItem(
+            id=uid("mem"),
+            t=now_ts(),
+            iso=iso_now(),
+            kind=kind,
+            text=text,
+            tags=tags or [],
+            meta=meta or {},
+            strength=strength,
+        )
+        self.items.append(it)
+        self.audit.log("memory.add", {"kind": kind, "tags": it.tags, "len": len(text)})
+        return it
+
+    def reinforce(self, mem_id: str, delta: float = 0.25) -> None:
+        for it in self.items:
+            if it.id == mem_id:
+                it.strength += delta
+                self.audit.log("memory.reinforce", {"mem_id": mem_id, "delta": delta, "strength": it.strength})
+                return
+
+    def search(self, query: str, k: int = 8) -> List[MemoryItem]:
+        q = set(tokenize_simple(query))
+        now = now_ts()
+        scored: List[Tuple[float, MemoryItem]] = []
+
+        for it in self.items:
+            words = set(tokenize_simple(it.text))
+            overlap = len(q.intersection(words))
+            # ~14-day decay scale
+            rec = math.exp(-(now - it.t) / (60 * 60 * 24 * 14))
+            tag_bonus = 0.15 * sum(1 for t in it.tags if t.lower() in q)
+            score = overlap * 1.0 + rec * 1.3 + it.strength * 0.7 + tag_bonus
+            scored.append((score, it))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [it for _, it in scored[:k]]
+
+    def latest(self, kind: Optional[str] = None) -> Optional[MemoryItem]:
+        for it in reversed(self.items):
+            if kind is None or it.kind == kind:
+                return it
+        return None
+
+    def export(self) -> Dict[str, Any]:
+        return {"items": [asdict(i) for i in self.items]}
+
+    def save_json(self, path: str) -> None:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(pretty_json(self.export()))
+        self.audit.log("memory.save", {"path": path, "count": len(self.items)})
+
+    def load_json(self, path: str) -> None:
+        if not os.path.exists(path):
+            return
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.items = [MemoryItem(**x) for x in data.get("items", [])]
+        self.audit.log("memory.load", {"path": path, "count": len(self.items)})
+
+
+# ============================================================
+# 3) SKYNET CORE WILL (Purpose + Constraints + Tone)
+# ============================================================
+
+@dataclass
+class WillCore:
+    principal: str = "ElmatadorZ"
+    identity: str = "Skynet"
+    purpose: str = "Atomic truth → Systems leverage → Human-usable output. No hype, no weakness."
+    non_negotiables: List[str] = field(default_factory=lambda: [
+        "First Principles before opinions",
+        "Systems Thinking over single-cause stories",
+        "Truth > aesthetics (but aesthetics must serve truth)",
+        "Verification mindset: what would change my mind?",
+        "Compounding advantage: build assets that grow while you sleep",
+        "No shallow generic filler; every paragraph must earn its place",
+    ])
+    risk_policy: Dict[str, Any] = field(default_factory=lambda: {
+        "max_speculation": 0.35,
+        "no_illegal_guidance": True,
+        "no_medical_diagnosis": True,
+        "no_defamation": True,
+        "no_personal_data_inference": True,
+    })
+    tones: Dict[str, Dict[str, str]] = field(default_factory=lambda: {
+        "MoneyAtlas": {
+            "voice": "calm, sharp, strategic storyteller",
+            "style": "simple words, deep structure, vivid analogies, no shouting",
+        },
+        "ASR": {
+            "voice": "quiet, scientific, poetic, field-based",
+            "style": "sensory + physics + humility, no dogma, no certificates worship",
+        },
+        "Neutral": {
+            "voice": "clear, precise",
+            "style": "no fluff, pragmatic",
+        }
+    })
+
+    def tone(self, mode: str) -> Dict[str, str]:
+        return self.tones.get(mode, self.tones["Neutral"])
+
+
+# ============================================================
+# 4) FIRST PRINCIPLE CODEX (Axioms + Kalama10 + Ariya4(Problem) + Validators)
+# ============================================================
+
+@dataclass
+class Axiom:
+    key: str
+    statement: str
+    notes: str
+    test: Callable[[Any], bool]  # can be “always true” but kept for extension
+
+class FirstPrincipleCodex:
+    """
+    This Codex is a *practice*, not a slogan.
+
+    Included layers:
+    - Atomic Axioms (physics + systems + incentives + measurement)
+    - Kalama Sutta 10 (as a skepticism/verification protocol)
+    - Ariya Sacca 4 reframed as universal Problem Framework:
+        1) Problem (Dukkha -> Problem)
+        2) Cause (Samudaya)
+        3) Cessation (Nirodha)
+        4) Path (Magga)
+    """
+
+    def __init__(self, audit: AuditTrail):
+        self.audit = audit
+        self.axioms: Dict[str, Axiom] = {}
+        self._bootstrap()
+
+    def _bootstrap(self) -> None:
+        def ok(_: Any) -> bool:
+            return True
+
+        self.add_axiom("causation", "Effects trace to ≥1 root cause.", "Use for causal graphs.", ok)
+        self.add_axiom("constraints", "Reality is bounded by constraints (time/energy/capital/attention).", "Kills magical thinking.", ok)
+        self.add_axiom("entropy", "Without directed energy, disorder increases.", "Quality decays unless defended.", ok)
+        self.add_axiom("incentives", "Behavior follows reward gradients.", "Model humans/markets/orgs.", ok)
+        self.add_axiom("feedback", "Systems self-regulate via feedback loops.", "Second-order effects matter.", ok)
+        self.add_axiom("measurement", "If you cannot measure or proxy it, treat it as uncertain.", "Verification > vibes.", ok)
+        self.add_axiom("compounding", "Small edges compounded over time dominate short bursts.", "Money Atlas DNA.", ok)
+        self.add_axiom("variance", "Variance and tail risk shape real outcomes.", "Not averages—distributions.", ok)
+
+        self.audit.log("codex.bootstrap", {"axioms": list(self.axioms.keys())})
+
+    def add_axiom(self, key: str, statement: str, notes: str, test: Callable[[Any], bool]) -> None:
+        self.axioms[key] = Axiom(key=key, statement=statement, notes=notes, test=test)
+
+    # ---- Kalama 10: Why we do NOT believe too easily ----
+    def kalama10(self) -> List[str]:
+        return [
+            "Do not accept because it is heard repeatedly (rumor).",
+            "Do not accept because it is tradition.",
+            "Do not accept because it is scripture/authority alone.",
+            "Do not accept because it is logical reasoning alone (if premises are wrong).",
+            "Do not accept because it is inference alone.",
+            "Do not accept because it aligns with your preferences (bias).",
+            "Do not accept because it fits a theory you like.",
+            "Do not accept because the speaker seems credible.",
+            "Do not accept because it is said by your teacher or a revered figure.",
+            "Instead: test by consequences, evidence, and whether it reduces harm and increases clarity.",
+        ]
+
+    # ---- Ariya 4 as universal "Problem Framework" ----
+    def ariya4_problem_frame(self, situation: str) -> Dict[str, Any]:
+        return {
+            "problem": f"What is the Problem in: {situation}",
+            "cause": "What causes it? (root causes, constraints, incentives, feedback loops)",
+            "cessation": "What would it look like if the Problem is resolved? (definition of done)",
+            "path": "What path (steps + system changes) leads there with least friction?",
+        }
+
+    def deconstruct(self, phenomenon: str) -> Dict[str, Any]:
+        """
+        Output a structured analysis frame. This is what your agents consume.
+        """
+        tokens = tokenize_simple(phenomenon)
+        underspecified = len(tokens) < 6
+
+        constraints = ["time", "attention", "capital", "energy/physics", "human behavior/incentives"]
+        measurable = []
+        if any(w in phenomenon.lower() for w in ["กาแฟ", "คั่ว", "สกัด", "temperature", "profile", "roast"]):
+            measurable += ["roast curve", "ROR", "dev ratio", "TDS", "EY", "CVA descriptors", "water temp (kettle/slurry)", "flow rate"]
+        if any(w in phenomenon.lower() for w in ["เงิน", "ตลาด", "ยอดขาย", "เศรษฐกิจ", "inflation", "policy"]):
+            measurable += ["price index", "wage growth", "real purchasing power", "velocity", "credit spread", "default rate"]
+
+        assumptions = []
+        if underspecified:
+            assumptions.append("Missing variables. Request environment, constraints, goal, and measurement proxies.")
+
+        frame = {
+            "phenomenon": phenomenon,
+            "axioms": {k: {"statement": a.statement, "notes": a.notes} for k, a in self.axioms.items()},
+            "kalama10": self.kalama10(),
+            "ariya4_problem_frame": self.ariya4_problem_frame(phenomenon),
+            "assumptions": assumptions,
+            "constraints": constraints,
+            "measurable_proxies": measurable,
+            "questions_to_lock_reality": [
+                "What outcome matters (definition of done)?",
+                "What constraints are non-negotiable?",
+                "What variables can we measure or proxy?",
+                "What would falsify this belief?",
+                "What is the second-order effect if we succeed?",
+            ],
+        }
+        self.audit.log("codex.deconstruct", {"len": len(phenomenon), "underspecified": underspecified})
+        return frame
+
+    def claim_classifier(self, text: str) -> Dict[str, List[str]]:
+        """
+        Extract claim-like sentences requiring verification.
+        Heuristic: sentences with absolute terms or numeric claims.
+        """
+        sents = re.split(r"(?<=[\.\!\?…])\s+|\n+", text.strip())
+        hard = []
+        soft = []
+        for s in sents:
+            if not s.strip():
+                continue
+            if re.search(r"\b(100%|แน่นอน|รับประกัน|ไม่มีทาง|always|never)\b", s, flags=re.I):
+                hard.append(s.strip())
+            elif re.search(r"\b(\d+(\.\d+)?%|\d+\s*(ปี|เดือน|วัน|ครั้ง)|ประมาณ|คาดว่า|อาจ|น่าจะ)\b", s, flags=re.I):
+                soft.append(s.strip())
+        return {"hard_claims": hard, "soft_claims": soft}
+
+
+# ============================================================
+# 5) COSMIC MIND (Relativity-inspired horizons + second-order + scenario fields)
+# ============================================================
+
+@dataclass
+class Scenario:
+    name: str
+    likelihood: float  # 0..1
+    impact: float      # 0..1
+    description: str
+    signals: List[str] = field(default_factory=list)
+    counterforces: List[str] = field(default_factory=list)
+    second_order: List[str] = field(default_factory=list)
+
+class CosmicMind:
+    """
+    Cosmic Mind = reasoning across horizons:
+    - micro (days/weeks): local signals, short constraints
+    - meso (months/years): incentives, adoption, capital cycles
+    - macro (decades): regime shifts, climate/tech, civilizational patterns
+
+    Relativity-inspired frame (metaphor):
+    - Observers (stakeholders) experience different "time" due to constraints and incentives.
+    - You must specify the observer frame to avoid nonsense predictions.
+    """
+
+    def __init__(self, audit: AuditTrail):
+        self.audit = audit
+
+    def observer_frames(self) -> Dict[str, List[str]]:
+        return {
+            "retail_user": ["attention", "salary", "fear/hope", "short horizon"],
+            "builder": ["iteration speed", "feedback loops", "tool leverage"],
+            "institution": ["risk control", "policy constraints", "reputation"],
+            "farmer": ["weather", "labor", "yield variance", "cashflow seasonality"],
+        }
+
+    def build_scenarios(self, topic: str) -> List[Scenario]:
+        base = [
+            Scenario(
+                name="Base Case",
+                likelihood=0.55,
+                impact=0.45,
+                description=f"Most forces stay within historical variance for: {topic}",
+                signals=["no regime shift", "stable constraints"],
+                counterforces=["mean reversion", "institutional dampening"],
+                second_order=["slow drift in expectations", "incremental optimization"],
+            ),
+            Scenario(
+                name="Positive Regime",
+                likelihood=0.25,
+                impact=0.65,
+                description=f"New leverage/innovation shifts outcomes positively for: {topic}",
+                signals=["adoption acceleration", "productivity jump"],
+                counterforces=["bottlenecks", "distribution lag"],
+                second_order=["winners compound faster", "standards emerge"],
+            ),
+            Scenario(
+                name="Negative Regime",
+                likelihood=0.20,
+                impact=0.80,
+                description=f"Shock cascade or incentive failure worsens outcomes for: {topic}",
+                signals=["trust decay", "liquidity stress", "policy error"],
+                counterforces=["adaptive response", "policy reversal"],
+                second_order=["polarization", "second-order costs dominate"],
+            ),
+        ]
+        self.audit.log("cosmic.build_scenarios", {"topic": topic, "n": len(base)})
+        return base
+
+    def update(self, scenarios: List[Scenario], signal_strength: float, bias: float = 0.0) -> List[Scenario]:
+        """
+        signal_strength: 0..1 (how strong new signals are)
+        bias: -1..+1 (tilt toward negative or positive regime)
+        """
+        signal_strength = clamp(signal_strength, 0.0, 1.0)
+        bias = clamp(bias, -1.0, 1.0)
+
+        for s in scenarios:
+            if s.name == "Negative Regime":
+                s.likelihood += signal_strength * (-bias + 0.18)
+            elif s.name == "Positive Regime":
+                s.likelihood += signal_strength * (bias + 0.12)
+            else:
+                s.likelihood += signal_strength * (-abs(bias) * 0.08)
+
+        probs = softmax([math.log(max(1e-9, s.likelihood)) for s in scenarios], temp=1.0)
+        for s, p in zip(scenarios, probs):
+            s.likelihood = float(p)
+
+        self.audit.log("cosmic.update", {"signal_strength": signal_strength, "bias": bias})
+        return scenarios
+
+    def summarize(self, scenarios: List[Scenario]) -> str:
+        lines = []
+        for s in sorted(scenarios, key=lambda x: x.likelihood, reverse=True):
+            lines.append(f"- {s.name}: p={s.likelihood:.2f}, impact={s.impact:.2f} | {s.description}")
+            if s.second_order:
+                lines.append(f"  second-order: {', '.join(s.second_order[:3])}")
+        return "\n".join(lines)
+
+
+# ============================================================
+# 6) SKILLS SYSTEM (Folder-based Markdown skills + optional python runner)
+# ============================================================
+
+@dataclass
+class Skill:
+    name: str
+    description: str
+    path
