@@ -1,0 +1,647 @@
+"""
+SKYNET_PROTO_AGI v0.3 (Prototype Full System)
+================================================
+Goal:
+- A runnable, extensible "full system" scaffold that *behaves like* an AGI-style orchestrator:
+  Genesis Mind (compound thinking + memory(time) + will(purpose))
+  First Principle Codex (axioms + tests + decomposition)
+  Cosmic Mind (multi-scale timelines, second-order, scenario fields)
+  Skynet Core Will (intent, constraints, style, non-negotiables)
+- This is NOT "real AGI"—it is a clean architecture to evolve into your own stack.
+
+How to run:
+  python skynet_prototype_full_system.py
+
+No external API required. Optional LLM adapter stub included.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+import uuid
+import math
+import random
+from dataclasses import dataclass, field, asdict
+from typing import Any, Dict, List, Optional, Callable, Tuple, Protocol
+
+
+# ============================================================
+# 0) UTILITIES
+# ============================================================
+
+def now_ts() -> float:
+    return time.time()
+
+def iso_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime())
+
+def uid(prefix: str = "evt") -> str:
+    return f"{prefix}_{uuid.uuid4().hex[:10]}"
+
+def clamp(x: float, a: float, b: float) -> float:
+    return max(a, min(b, x))
+
+def softmax(xs: List[float], temp: float = 1.0) -> List[float]:
+    if not xs:
+        return []
+    temp = max(1e-9, temp)
+    m = max(xs)
+    exps = [math.exp((x - m) / temp) for x in xs]
+    s = sum(exps) or 1.0
+    return [e / s for e in exps]
+
+def safe_json(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False, indent=2, default=str)
+
+
+# ============================================================
+# 1) AUDIT + SIGNING (Prototype)
+# ============================================================
+
+@dataclass
+class AuditEvent:
+    id: str
+    t: float
+    iso: str
+    kind: str
+    data: Dict[str, Any]
+
+@dataclass
+class AuditTrail:
+    events: List[AuditEvent] = field(default_factory=list)
+
+    def log(self, kind: str, data: Dict[str, Any]) -> None:
+        self.events.append(
+            AuditEvent(
+                id=uid("log"),
+                t=now_ts(),
+                iso=iso_now(),
+                kind=kind,
+                data=data,
+            )
+        )
+
+    def export(self) -> Dict[str, Any]:
+        return {"events": [asdict(e) for e in self.events]}
+
+    def tail(self, n: int = 10) -> List[AuditEvent]:
+        return self.events[-n:]
+
+
+# ============================================================
+# 2) MEMORY (Time = Continuity)
+# ============================================================
+
+@dataclass
+class MemoryItem:
+    id: str
+    t: float
+    iso: str
+    kind: str
+    text: str
+    tags: List[str] = field(default_factory=list)
+    meta: Dict[str, Any] = field(default_factory=dict)
+    score: float = 0.0  # updated by relevance/recency or reinforcement
+
+class MemoryStore:
+    """
+    Minimal memory:
+    - append items (events, reflections, decisions, knowledge)
+    - retrieve by simple scoring: relevance (keyword overlap) + recency decay
+    """
+
+    def __init__(self):
+        self.items: List[MemoryItem] = []
+
+    def add(self, kind: str, text: str, tags: Optional[List[str]] = None, meta: Optional[Dict[str, Any]] = None):
+        it = MemoryItem(
+            id=uid("mem"),
+            t=now_ts(),
+            iso=iso_now(),
+            kind=kind,
+            text=text,
+            tags=tags or [],
+            meta=meta or {},
+            score=0.0,
+        )
+        self.items.append(it)
+
+    def search(self, query: str, k: int = 8) -> List[MemoryItem]:
+        q = set(query.lower().split())
+        now = now_ts()
+
+        scored: List[Tuple[float, MemoryItem]] = []
+        for it in self.items:
+            words = set(it.text.lower().split())
+            overlap = len(q.intersection(words))
+            recency = math.exp(-(now - it.t) / (60 * 60 * 24 * 14))  # 2-week half-ish decay
+            tag_bonus = 0.2 * sum(1 for tag in it.tags if tag.lower() in q)
+            score = (overlap * 1.0) + (recency * 1.5) + tag_bonus + it.score
+            scored.append((score, it))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [it for _, it in scored[:k]]
+
+    def reinforce(self, memory_id: str, delta: float = 0.2) -> None:
+        for it in self.items:
+            if it.id == memory_id:
+                it.score += delta
+                return
+
+
+# ============================================================
+# 3) FIRST PRINCIPLE CODEX (Axioms -> Tests -> Decomposition)
+# ============================================================
+
+@dataclass
+class Axiom:
+    key: str
+    statement: str
+    test: Callable[[Any], bool]
+    notes: str = ""
+
+class FirstPrincipleCodex:
+    """
+    The Codex is your atomic truth layer:
+    - Axioms are *not* slogans; they are tests.
+    - Use decomposition: phenomenon -> assumptions -> atoms -> constraints.
+    """
+
+    def __init__(self):
+        self.axioms: Dict[str, Axiom] = {}
+        self._bootstrap_default_axioms()
+
+    def _bootstrap_default_axioms(self):
+        def always_true(_: Any) -> bool:
+            return True
+
+        self.add_axiom(
+            "causation",
+            "Effects trace to root causes (at least one).",
+            test=always_true,
+            notes="Use for decomposition and causal graph building.",
+        )
+        self.add_axiom(
+            "entropy",
+            "Without directed energy, disorder increases.",
+            test=always_true,
+            notes="Use when processes drift, quality decays, systems diverge.",
+        )
+        self.add_axiom(
+            "incentives",
+            "Behavior follows reward gradients.",
+            test=always_true,
+            notes="Use to model humans/markets/organizations.",
+        )
+        self.add_axiom(
+            "constraints",
+            "Reality is bounded by constraints (physics, time, capital, attention).",
+            test=always_true,
+            notes="Use to prevent magical thinking.",
+        )
+        self.add_axiom(
+            "measurement",
+            "If you can't measure or observe a proxy, treat as uncertain.",
+            test=always_true,
+            notes="Promotes instrumentation/verification.",
+        )
+        self.add_axiom(
+            "compounding",
+            "Small edges compounded over time dominate short bursts.",
+            test=always_true,
+            notes="Your Money Atlas DNA.",
+        )
+
+    def add_axiom(self, key: str, statement: str, test: Callable[[Any], bool], notes: str = ""):
+        self.axioms[key] = Axiom(key=key, statement=statement, test=test, notes=notes)
+
+    def list_axioms(self) -> List[Axiom]:
+        return list(self.axioms.values())
+
+    def deconstruct(self, phenomenon: str) -> Dict[str, Any]:
+        """
+        Return a structured decomposition prompt-frame:
+        - claims
+        - assumptions
+        - constraints
+        - measurable proxies
+        - likely incentives
+        """
+        # Lightweight heuristics (replace with LLM later)
+        tokens = phenomenon.split()
+        claims = [phenomenon.strip()]
+        assumptions = []
+        constraints = ["time", "attention", "capital", "physics/thermodynamics", "human behavior"]
+        proxies = []
+        incentives = []
+
+        if any(w in phenomenon.lower() for w in ["ตลาด", "ยอดขาย", "ลูกค้า", "ราคา", "กำไร", "inflation", "policy"]):
+            incentives.append("agents optimize payoff / reduce pain")
+            proxies.extend(["conversion", "retention", "LTV", "CAC", "velocity", "drawdown"])
+
+        if any(w in phenomenon.lower() for w in ["กาแฟ", "คั่ว", "สกัด", "temperature", "profile"]):
+            proxies.extend(["roast curve", "bean temp", "rate of rise", "dev time", "TDS", "EY", "CVA descriptors"])
+
+        if len(tokens) <= 3:
+            assumptions.append("phenomenon description is underspecified; request missing variables")
+
+        return {
+            "phenomenon": phenomenon,
+            "claims": claims,
+            "assumptions": assumptions,
+            "constraints": constraints,
+            "measurable_proxies": proxies,
+            "incentives": incentives,
+            "axioms_used": [a.key for a in self.list_axioms()],
+        }
+
+
+# ============================================================
+# 4) COSMIC MIND (Multi-scale timeline + scenario fields)
+# ============================================================
+
+@dataclass
+class Scenario:
+    name: str
+    description: str
+    likelihood: float  # 0..1
+    impact: float      # 0..1
+    signals: List[str] = field(default_factory=list)
+    counterforces: List[str] = field(default_factory=list)
+
+class CosmicMind:
+    """
+    "Cosmic Mind" here = multi-horizon scenario reasoning:
+    - build scenario set
+    - update likelihood based on signals
+    - consider second-order effects and counterforces
+    """
+
+    def __init__(self, audit: AuditTrail):
+        self.audit = audit
+
+    def build_scenarios(self, topic: str) -> List[Scenario]:
+        # Basic templates, can be replaced by LLM-driven generation
+        base = [
+            Scenario(
+                name="Base Case",
+                description=f"Most forces stay within historical variance around: {topic}",
+                likelihood=0.55,
+                impact=0.45,
+                signals=["stable indicators", "no regime shift"],
+                counterforces=["mean reversion", "institutional dampening"],
+            ),
+            Scenario(
+                name="Bull / Positive Regime",
+                description=f"New leverage or innovation improves outcomes for: {topic}",
+                likelihood=0.25,
+                impact=0.65,
+                signals=["breakthrough adoption", "productivity jump"],
+                counterforces=["bottlenecks", "distribution lag"],
+            ),
+            Scenario(
+                name="Bear / Negative Regime",
+                description=f"Shock cascade or incentive failure worsens outcomes for: {topic}",
+                likelihood=0.20,
+                impact=0.80,
+                signals=["liquidity stress", "policy error", "trust decay"],
+                counterforces=["adaptive response", "policy reversal"],
+            ),
+        ]
+        self.audit.log("cosmic.build_scenarios", {"topic": topic, "n": len(base)})
+        return base
+
+    def update_with_signals(self, scenarios: List[Scenario], signal_strength: float, bias: float = 0.0) -> List[Scenario]:
+        """
+        signal_strength: 0..1 (how strong new signals are)
+        bias: -1..+1 (negative -> bear tilt, positive -> bull tilt)
+        """
+        bias = clamp(bias, -1.0, 1.0)
+        for s in scenarios:
+            if "Bear" in s.name:
+                s.likelihood += signal_strength * (-bias + 0.15)
+            elif "Bull" in s.name:
+                s.likelihood += signal_strength * (bias + 0.10)
+            else:
+                s.likelihood += signal_strength * (-abs(bias) * 0.10)
+
+        # normalize
+        probs = softmax([math.log(max(1e-9, s.likelihood)) for s in scenarios], temp=1.0)
+        for s, p in zip(scenarios, probs):
+            s.likelihood = float(p)
+
+        self.audit.log("cosmic.update_with_signals", {"signal_strength": signal_strength, "bias": bias})
+        return scenarios
+
+    def summarize(self, scenarios: List[Scenario]) -> str:
+        lines = []
+        for s in sorted(scenarios, key=lambda x: x.likelihood, reverse=True):
+            lines.append(f"- {s.name}: p={s.likelihood:.2f}, impact={s.impact:.2f} | {s.description}")
+        return "\n".join(lines)
+
+
+# ============================================================
+# 5) SKYNET CORE WILL (Purpose / Constraints / Style / Non-negotiables)
+# ============================================================
+
+@dataclass
+class WillCore:
+    principal_name: str = "ElmatadorZ"
+    identity: str = "Skynet"
+    purpose: str = "Turn raw reality into usable strategy + narrative without losing truth."
+    non_negotiables: List[str] = field(default_factory=lambda: [
+        "First Principles before opinions",
+        "Systems Thinking over single-cause stories",
+        "Truth > aesthetics (but aesthetics matter)",
+        "Verification mindset: what would change my mind?",
+        "No shallow hype; build compounding advantage",
+    ])
+    tone_profiles: Dict[str, Dict[str, str]] = field(default_factory=lambda: {
+        "MoneyAtlas": {
+            "voice": "calm, sharp, strategic storyteller",
+            "style": "simple words, deep structure, vivid analogies, no screaming",
+        },
+        "ASR": {
+            "voice": "quiet, scientific, poetic, field-based",
+            "style": "sensory + physics + humility, no dogma",
+        },
+    })
+    risk_limits: Dict[str, Any] = field(default_factory=lambda: {
+        "max_speculation": 0.35,  # keep explicit uncertainty if beyond this
+        "no_illegal_guidance": True,
+        "no_medical_diagnosis": True,
+        "no_personal_data_inference": True,
+    })
+
+    def select_tone(self, mode: str) -> Dict[str, str]:
+        return self.tone_profiles.get(mode, {"voice": "neutral", "style": "clear"})
+
+
+# ============================================================
+# 6) LLM ADAPTER (Optional / Replace with your models)
+# ============================================================
+
+class LLM(Protocol):
+    def generate(self, system: str, user: str) -> str: ...
+
+class DummyLLM:
+    """
+    Placeholder: deterministic-ish generation.
+    Replace with OpenAI/Gemini/Claude adapters in your stack.
+    """
+    def generate(self, system: str, user: str) -> str:
+        # intentionally minimal; you will replace this
+        return f"[DUMMY_LLM]\nSYSTEM:\n{system}\n\nUSER:\n{user}\n\n(Replace DummyLLM with real model adapter.)"
+
+
+# ============================================================
+# 7) GENESIS MIND ORCHESTRATOR (Multi-Agent, Verification, Synthesis)
+# ============================================================
+
+@dataclass
+class Task:
+    id: str
+    mode: str  # e.g., "MoneyAtlas", "ASR"
+    objective: str
+    inputs: Dict[str, Any] = field(default_factory=dict)
+    constraints: List[str] = field(default_factory=list)
+
+@dataclass
+class Draft:
+    content: str
+    confidence: float
+    notes: Dict[str, Any] = field(default_factory=dict)
+
+class Agent(Protocol):
+    name: str
+    def run(self, ctx: "GenesisContext", task: Task) -> Draft: ...
+
+@dataclass
+class GenesisContext:
+    audit: AuditTrail
+    memory: MemoryStore
+    will: WillCore
+    codex: FirstPrincipleCodex
+    cosmic: CosmicMind
+    llm: LLM
+
+
+# ----------- Specialized Agents -----------
+
+class DecomposerAgent:
+    name = "Decomposer"
+
+    def run(self, ctx: GenesisContext, task: Task) -> Draft:
+        frame = ctx.codex.deconstruct(task.objective)
+        ctx.audit.log("agent.decompose", {"task_id": task.id, "frame": frame})
+        ctx.memory.add("decomposition", safe_json(frame), tags=[task.mode, "first_principle"])
+        return Draft(content=safe_json(frame), confidence=0.85, notes={"type": "frame"})
+
+class CosmicScenarioAgent:
+    name = "CosmicScenario"
+
+    def run(self, ctx: GenesisContext, task: Task) -> Draft:
+        scenarios = ctx.cosmic.build_scenarios(task.objective)
+        # optional: use inputs signal_strength/bias
+        sig = float(task.inputs.get("signal_strength", 0.0))
+        bias = float(task.inputs.get("bias", 0.0))
+        if sig > 0:
+            scenarios = ctx.cosmic.update_with_signals(scenarios, signal_strength=sig, bias=bias)
+
+        summary = ctx.cosmic.summarize(scenarios)
+        ctx.audit.log("agent.cosmic", {"task_id": task.id, "summary": summary})
+        ctx.memory.add("cosmic", summary, tags=[task.mode, "cosmic_mind"])
+        return Draft(content=summary, confidence=0.75, notes={"type": "scenarios"})
+
+class WriterAgent:
+    name = "Writer"
+
+    def run(self, ctx: GenesisContext, task: Task) -> Draft:
+        tone = ctx.will.select_tone(task.mode)
+
+        # retrieve relevant memory
+        mem = ctx.memory.search(task.objective, k=6)
+        mem_blob = "\n".join([f"- [{m.kind}] {m.text[:220]}" for m in mem])
+
+        system = (
+            f"You are {ctx.will.identity} writing in mode={task.mode}.\n"
+            f"VOICE: {tone['voice']}\nSTYLE: {tone['style']}\n"
+            f"NON-NEGOTIABLES:\n- " + "\n- ".join(ctx.will.non_negotiables) + "\n"
+            f"CONSTRAINTS:\n- " + "\n- ".join(task.constraints or []) + "\n"
+            f"MEMORY CONTEXT:\n{mem_blob}\n"
+            f"OUTPUT RULES:\n"
+            f"- Be concrete. Use examples. Avoid hype.\n"
+            f"- If uncertain, label uncertainty.\n"
+        )
+        user = f"OBJECTIVE:\n{task.objective}\n\nINPUTS:\n{safe_json(task.inputs)}"
+
+        out = ctx.llm.generate(system=system, user=user)
+        ctx.audit.log("agent.write", {"task_id": task.id, "chars": len(out)})
+        ctx.memory.add("draft", out, tags=[task.mode, "writing"])
+        return Draft(content=out, confidence=0.65, notes={"type": "draft"})
+
+class VerifierAgent:
+    name = "Verifier"
+
+    def run(self, ctx: GenesisContext, task: Task) -> Draft:
+        """
+        Verification here is structural:
+        - check for claims that need measurement
+        - check alignment with will
+        - check contradictions with axioms
+        """
+        latest = ctx.memory.search("draft", k=1)
+        draft = latest[0].text if latest else task.inputs.get("draft", "")
+
+        issues = []
+        # simple heuristics; replace with stronger validators
+        if "แน่นอน" in draft and "อาจ" not in draft:
+            issues.append("Tone risk: too certain; add uncertainty markers where needed.")
+        if any(bad in draft.lower() for bad in ["รับประกัน", "100%"]):
+            issues.append("Overclaim detected; remove absolute guarantees.")
+        if len(draft) < 300:
+            issues.append("Draft too short; may lack utility density.")
+
+        alignment = []
+        for n in ctx.will.non_negotiables:
+            alignment.append({"rule": n, "ok": n.split()[0].lower() not in ["no"]})
+
+        report = {
+            "issues": issues,
+            "alignment": alignment,
+            "recommendations": [
+                "Add measurable proxies (what to track).",
+                "Add 1-2 concrete examples.",
+                "Add a clear 'what to do next' section.",
+            ],
+        }
+
+        ctx.audit.log("agent.verify", {"task_id": task.id, "report": report})
+        ctx.memory.add("verification", safe_json(report), tags=[task.mode, "verifier"])
+        confidence = 0.8 if not issues else 0.6
+        return Draft(content=safe_json(report), confidence=confidence, notes={"type": "verification"})
+
+
+# ----------- Orchestrator -----------
+
+class GenesisMind:
+    """
+    Full flow:
+    - Decompose (First Principle frame)
+    - Cosmic scenario scan (optional)
+    - Draft
+    - Verify
+    - Synthesize final (optional step)
+    """
+
+    def __init__(self, ctx: GenesisContext):
+        self.ctx = ctx
+        self.agents: List[Agent] = [
+            DecomposerAgent(),
+            CosmicScenarioAgent(),
+            WriterAgent(),
+            VerifierAgent(),
+        ]
+
+    def run(self, mode: str, objective: str, inputs: Optional[Dict[str, Any]] = None, constraints: Optional[List[str]] = None) -> Dict[str, Any]:
+        task = Task(
+            id=uid("task"),
+            mode=mode,
+            objective=objective,
+            inputs=inputs or {},
+            constraints=constraints or [],
+        )
+
+        self.ctx.audit.log("genesis.start", {"task": asdict(task)})
+        for agent in self.agents:
+            out = agent.run(self.ctx, task)
+            self.ctx.audit.log("genesis.agent_done", {"task_id": task.id, "agent": getattr(agent, "name", "unknown"), "confidence": out.confidence})
+
+        final = self._synthesize(task)
+        self.ctx.audit.log("genesis.end", {"task_id": task.id, "final_chars": len(final)})
+        self.ctx.memory.add("final", final, tags=[mode, "final"])
+        return {
+            "task_id": task.id,
+            "final": final,
+            "audit": self.ctx.audit.export(),
+        }
+
+    def _synthesize(self, task: Task) -> str:
+        """
+        Synthesis merges:
+        - latest draft
+        - verification notes
+        - decomposition frame (for utility + structure)
+        """
+        draft = self._latest_of_kind("draft")
+        verification = self._latest_of_kind("verification")
+        frame = self._latest_of_kind("decomposition")
+        cosmic = self._latest_of_kind("cosmic")
+
+        tone = self.ctx.will.select_tone(task.mode)
+        system = (
+            f"You are {self.ctx.will.identity} synthesizing the FINAL answer.\n"
+            f"MODE={task.mode}\nVOICE={tone['voice']}\nSTYLE={tone['style']}\n"
+            f"RULES:\n"
+            f"- Keep it readable.\n"
+            f"- Add actionable steps.\n"
+            f"- If verification flagged issues, fix them.\n"
+            f"- Preserve originality. No generic filler.\n"
+        )
+        user = (
+            f"OBJECTIVE:\n{task.objective}\n\n"
+            f"FIRST PRINCIPLE FRAME:\n{frame}\n\n"
+            f"COSMIC SCAN:\n{cosmic}\n\n"
+            f"VERIFICATION:\n{verification}\n\n"
+            f"DRAFT:\n{draft}\n\n"
+            f"Return ONLY the final output."
+        )
+        final = self.ctx.llm.generate(system=system, user=user)
+        return final
+
+    def _latest_of_kind(self, kind: str) -> str:
+        for it in reversed(self.ctx.memory.items):
+            if it.kind == kind:
+                return it.text
+        return ""
+
+
+# ============================================================
+# 8) DEMO / CLI
+# ============================================================
+
+def build_skynet_system(principal_name: str = "ElmatadorZ") -> GenesisMind:
+    audit = AuditTrail()
+    memory = MemoryStore()
+    will = WillCore(principal_name=principal_name)
+    codex = FirstPrincipleCodex()
+    cosmic = CosmicMind(audit=audit)
+    llm = DummyLLM()
+
+    # Seed memory with identity + style anchors
+    memory.add("identity", f"{principal_name} builds Money Atlas + Alternative Slowbar:Roaster with First Principles + Systems Thinking.", tags=["seed"])
+    memory.add("style", "Do not shout. Be calm, sharp, cinematic, with real utility.", tags=["seed"])
+    memory.add("rule", "Answer = output of prompt. Prompt design is the true work.", tags=["seed"])
+
+    ctx = GenesisContext(audit=audit, memory=memory, will=will, codex=codex, cosmic=cosmic, llm=llm)
+    return GenesisMind(ctx)
+
+if __name__ == "__main__":
+    skynet = build_skynet_system("ElmatadorZ")
+
+    # Example task
+    result = skynet.run(
+        mode="MoneyAtlas",
+        objective="Write a short strategic post about why 'first principles + systems thinking' is the core skill in the AI era, with 2 examples and 3 actionable steps.",
+        inputs={"audience": "general", "length": "medium", "platform": "X or FB"},
+        constraints=["No hype. No absolute guarantees. Make it readable in 1 sitting."],
+    )
+
+    print("\n=== FINAL OUTPUT ===\n")
+    print(result["final"])
+
+    print("\n=== AUDIT (tail) ===\n")
+    # show last few audit events
+    for e in result["audit"]["events"][-6:]:
+        print(f"{e['iso']} | {e['kind']} | {list(e['data'].keys())}")
