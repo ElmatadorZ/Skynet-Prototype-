@@ -959,3 +959,44 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+  # ============================================================
+# EXT-1) Claim Extractor
+# ============================================================
+
+@dataclass
+class Claim:
+    id: str
+    text: str
+    claim_type: str   # fact | inference | opinion | instruction
+    proof_required: bool
+    proof_ids: List[str] = field(default_factory=list)
+    status: str = "unverified"  # verified | uncertain | rejected
+
+
+class ClaimExtractor:
+    """
+    Extracts atomic claims from text.
+    Conservative by design: prefer 'proof_required=True'
+    """
+
+    FACT_PATTERNS = [
+        r"\bคือ\b", r"\bทำให้\b", r"\bส่งผล\b", r"\bจะ\b", r"\bช่วย\b"
+    ]
+
+    def extract(self, text: str) -> List[Claim]:
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
+        claims: List[Claim] = []
+
+        for ln in lines:
+            proof_required = any(re.search(p, ln) for p in self.FACT_PATTERNS)
+            ctype = "fact" if proof_required else "opinion"
+
+            claims.append(
+                Claim(
+                    id=uid("CLM"),
+                    text=ln,
+                    claim_type=ctype,
+                    proof_required=proof_required
+                )
+            )
+        return claims
