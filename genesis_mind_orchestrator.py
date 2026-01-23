@@ -711,7 +711,7 @@ class CriticAgent:
             output=True,
         )
 
-        context.log(self.name, "critic.done", {"failure_modes": failure_modes, "hardening": hardening})
+        context.log(self.name, "critic.done", {"failure_modes": failure_modes, "hardening": harclaimslaimsening})
         return StepResult(
             step_id=uid("STEP"),
             agent=self.name,
@@ -999,4 +999,54 @@ class ClaimExtractor:
                     proof_required=proof_required
                 )
             )
-        return claims
+        return claim# ============================================================
+# EXT-2) Consensus Engine
+# ============================================================
+
+class ConsensusEngine:
+    """
+    Builds consensus from multiple agent outputs
+    Weighted by:
+      - number of proofs
+      - proof types (tool > derivation > axiom > assumption)
+    """
+
+    WEIGHTS = {
+        "tool": 3.0,
+        "derivation": 2.0,
+        "axiom": 1.5,
+        "assumption": 0.5
+    }
+
+    def score(self, proofs: List[Proof]) -> float:
+        score = 0.0
+        for p in proofs:
+            score += self.WEIGHTS.get(p.kind, 0.2)
+        return score
+
+    def select(self, candidates: Dict[str, Tuple[Any, List[Proof]]]) -> Dict[str, Any]:
+        """
+        candidates = {
+           agent_name: (output, [Proof, Proof, ...])
+        }
+        """
+        ranking = []
+
+        for agent, (out, proofs) in candidates.items():
+            s = self.score(proofs)
+            ranking.append((s, agent, out, proofs))
+
+        ranking.sort(reverse=True, key=lambda x: x[0])
+
+        best = ranking[0]
+        return {
+            "winner": best[1],
+            "output": best[2],
+            "score": best[0],
+            "reason": "highest proof-weighted score",
+            "alternatives": [
+                {"agent": r[1], "score": r[0]} for r in ranking[1:]
+            ]
+        }s
+
+
